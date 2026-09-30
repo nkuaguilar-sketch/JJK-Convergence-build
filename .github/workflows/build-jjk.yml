@@ -1,0 +1,47 @@
+name: Build JJK Convergence
+
+on:
+  push:
+    paths:
+      - 'JJK-Convergence-26.2-v0.5.6-fuga-rebuild-source.zip'
+      - '.github/workflows/build-jjk.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+          cache: gradle
+
+      - name: Extract source
+        run: |
+          rm -rf work
+          mkdir work
+          unzip -q JJK-Convergence-26.2-v0.5.6-fuga-rebuild-source.zip -d work
+          test -f work/jjk_050_source/codigo-fuente/gradlew
+          chmod +x work/jjk_050_source/codigo-fuente/gradlew
+
+      - name: Build jar
+        working-directory: work/jjk_050_source/codigo-fuente
+        run: ./gradlew jar -x test -x coreTest --stacktrace
+
+      - name: Collect jar
+        run: |
+          mkdir -p artifact
+          cp work/jjk_050_source/codigo-fuente/build/libs/*.jar artifact/
+          ls -lh artifact/
+
+      - name: Upload jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: JJK-Convergence-26.2-v0.5.6
+          path: artifact/*.jar
+          if-no-files-found: error
