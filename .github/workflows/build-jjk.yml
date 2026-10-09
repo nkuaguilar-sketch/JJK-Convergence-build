@@ -1,47 +1,62 @@
+
 name: Build JJK Convergence
 
 on:
+  workflow_dispatch:
   push:
     paths:
-      - 'JJK-Convergence-26.2-v0.5.6-fuga-rebuild-source.zip'
+      - '*source*.zip'
       - '.github/workflows/build-jjk.yml'
-  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Java 25
+      - name: Setup Java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '25'
-          cache: gradle
 
       - name: Extract source
+        shell: bash
         run: |
-          rm -rf work
+          set -e
+          ZIP=$(find . -maxdepth 1 -name '*source*.zip' | sort -V | tail -1)
+          test -n "$ZIP" || { echo "Falta ZIP fuente"; exit 1; }
           mkdir work
-          unzip -q JJK-Convergence-26.2-v0.5.6-fuga-rebuild-source.zip -d work
-          test -f work/jjk_050_source/codigo-fuente/gradlew
-          chmod +x work/jjk_050_source/codigo-fuente/gradlew
+          unzip -q "$ZIP" -d work
+          WRAPPER=$(find work -type f -name gradlew | head -1)
+          test -n "$WRAPPER" || { echo "Falta gradlew"; exit 1; }
+          echo "PROJECT_DIR=$(dirname "$WRAPPER")" >> "$GITHUB_ENV"
 
-      - name: Build jar
-        working-directory: work/jjk_050_source/codigo-fuente
-        run: ./gradlew jar -x test -x coreTest --stacktrace
-
-      - name: Collect jar
+      - name: Build NeoForge
         run: |
-          mkdir -p artifact
-          cp work/jjk_050_source/codigo-fuente/build/libs/*.jar artifact/
-          ls -lh artifact/
+          cd "$PROJECT_DIR"
+          chmod +x gradlew
+          ./gradlew assemble --no-daemon --stacktrace
 
-      - name: Upload jar
+      - name: Collect JAR
+        run: |
+          mkdir artifacts
+          find "$PROJECT_DIR" -path '*/build/libs/*.jar' \
+            ! -name '*-sources.jar' \
+            ! -name '*-javadoc.jar' \
+            -exec cp {} artifacts/ \;
+          test -n "$(ls -A artifacts)"
+
+      - name: Upload JAR
         uses: actions/upload-artifact@v4
         with:
-          name: JJK-Convergence-26.2-v0.5.6
-          path: artifact/*.jar
+          name: JJK-Convergence-JAR
+          path: artifacts/*.jar
           if-no-files-found: error
+  
