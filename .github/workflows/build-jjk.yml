@@ -1,72 +1,112 @@
-
-name: Build JJK Convergence
+name: JJK Convergence - Compilar y descargar cache
 
 on:
   workflow_dispatch:
-  push:
-    paths:
-      - '*source*.zip'
-      - '.github/workflows/build-jjk.yml'
+    inputs:
+      source_tag:
+        description: 'Tag de la Release que contiene el ZIP fuente mas reciente'
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 jobs:
-  build:
+  compilar:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
-
+    timeout-minutes: 90
     steps:
-      - name: Checkout
+      - name: Obtener repositorio
         uses: actions/checkout@v4
 
-      - name: Setup Java
+      - name: Preparar Java 25
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '25'
 
-      
-      - name: Download ZIP from Release
+      - name: Descargar ZIP fuente desde Release
         env:
           GH_TOKEN: ${{ github.token }}
+          SOURCE_TAG: ${{ inputs.source_tag }}
         run: |
-          gh release download source-v0.7.23 \
-            --repo "$GITHUB_REPOSITORY" \
-            --pattern '*.zip' \
-            --dir .
-            
-      - name: Extract source
+          set -euo pipefail
+          mkdir -p source-input
+          gh release download "$SOURCE_TAG" --repo "$GITHUB_REPOSITORY" --pattern '*source*.zip' --dir source-input
+
+      - name: Descomprimir fuente y localizar Gradle
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          zips=(source-input/*source*.zip)
+          if [ "${#zips[@]}" -ne 1 ]; then
+            echo 'ERROR: La Release debe contener exactamente un archivo *source*.zip'
+            ls -la source-input
+            exit 1
+          fi
+          mkdir -p work
+          unzip -q "${zips[0]}" -d work
+          mapfile -t wrappers < <(find work -type f -name gradlew)
+          if [ "${#wrappers[@]}" -ne 1 ]; then
+            echo 'ERROR: Se esperaba encontrar exactamente un gradlew en el ZIP'
+            exit 1
+          fi
+          project_dir=$(dirname "${wrappers[0]}")
+          test -f "$project_dir/build.gradle" || { echo 'ERROR: Falta build.gradle'; exit 1; }
+          echo "PROJECT_DIR=$project_dir" >> "$GITHUB_ENV"
+          echo "Proyecto: $project_dir"
+          grep '^mod_version=' "$project_dir/gradle.properties" || true
+
+      - name: Descargar dependencias y compilar JAR
         shell: bash
         run: |
-          set -e
-          ZIP=$(find . -maxdepth 1 -name '*source*.zip' | sort -V | tail -1)
-          test -n "$ZIP" || { echo "Falta ZIP fuente"; exit 1; }
-          mkdir work
-          unzip -q "$ZIP" -d work
-          WRAPPER=$(find work -type f -name gradlew | head -1)
-          test -n "$WRAPPER" || { echo "Falta gradlew"; exit 1; }
-          echo "PROJECT_DIR=$(dirname "$WRAPPER")" >> "$GITHUB_ENV"
-
-      - name: Build NeoForge
-        run: |
+          set -euo pipefail
           cd "$PROJECT_DIR"
-          chmod +x gradlew
-          ./gradlew assemble --no-daemon --stacktrace
+          chmod +x ./gradlew
+          ./gradlew assemble --no-daemon --stacktrace 2>&1 | tee "$GITHUB_WORKSPACE/compilacion.log"
 
-      - name: Collect JAR
+      - name: Recopilar JAR generado
+        if: always()
+        shell: bash
         run: |
-          mkdir artifacts
-          find "$PROJECT_DIR" -path '*/build/libs/*.jar' \
-            ! -name '*-sources.jar' \
-            ! -name '*-javadoc.jar' \
-            -exec cp {} artifacts/ \;
-          test -n "$(ls -A artifacts)"
+          mkdir -p jar-compilado
+          if [ -n "${PROJECT_DIR:-}" ] && [ -d "$PROJECT_DIR/build/libs" ]; then
+            find "$PROJECT_DIR/build/libs" -maxdepth 1 -type f -name '*.jar' ! -name '*-sources.jar' ! -name '*-javadoc.jar' -exec cp {} jar-compilado/ \;
+          fi
+          ls -lah jar-compilado
 
-      - name: Upload JAR
+      - name: Crear paquete de cache para compilar offline
+        if: always()
+        shell: bash
+        run: |
+          if [ -d "$HOME/.gradle/caches/modules-2" ]; then
+            tar -C "$HOME/.gradle/caches" -czf gradle-modules-2-actualizada.tar.gz modules-2
+            ls -lh gradle-modules-2-actualizada.tar.gz
+          else
+            echo 'No se genero cache modules-2'
+          fi
+
+      - name: Entregar JAR
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: JJK-Convergence-JAR
-          path: artifacts/*.jar
-          if-no-files-found: error
-  
+          name: JJK-JAR-compilado
+          path: jar-compilado/*.jar
+          if-no-files-found: warn
+
+      - name: Entregar cache actualizada
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Gradle-cache-actualizada
+          path: gradle-modules-2-actualizada.tar.gz
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Entregar registro de compilacion
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: JJK-errores-y-compilacion
+          path: compilacion.log
+          if-no-files-found: warn
