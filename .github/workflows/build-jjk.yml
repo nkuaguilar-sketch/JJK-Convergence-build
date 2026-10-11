@@ -1,112 +1,138 @@
-name: JJK - Exportar entorno completo para compilar offline
+name: JJK - GameTests y recursos para pruebas locales
 
 on:
   workflow_dispatch:
     inputs:
       source_tag:
-        description: 'Tag de la Release que contiene el ZIP fuente ya compilado'
+        description: 'Tag de la Release que contiene el ZIP fuente (ej. jjk-etapa3-build)'
         required: true
+        default: 'jjk-etapa3-build'
         type: string
 
 permissions:
   contents: read
 
 jobs:
-  compilar_y_exportar:
+  gametests:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
-      - name: Descargar repositorio
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Configurar Java 25
+      - name: Java 25
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '25'
 
-      - name: Recuperar fuente de la Release
+      - name: Descargar fuentes actuales de Release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           SOURCE_TAG: ${{ inputs.source_tag }}
         run: |
           set -euo pipefail
-          mkdir -p source-input work
-          gh release download "$SOURCE_TAG" --repo "$GITHUB_REPOSITORY" --pattern '*source*.zip' --dir source-input
+          mkdir -p input project
+          gh release download "$SOURCE_TAG" -R "$GITHUB_REPOSITORY" --pattern '*source*.zip' --dir input
           shopt -s nullglob
-          archives=(source-input/*source*.zip)
-          if (( ${#archives[@]} != 1 )); then
-            echo 'ERROR: La release debe contener un unico ZIP *source*.zip'
+          zips=(input/*source*.zip)
+          if (( ${#zips[@]} != 1 )); then
+            echo 'Se necesita exactamente un ZIP fuente en la Release'
             exit 1
           fi
-          unzip -q "${archives[0]}" -d work
-          mapfile -t wrappers < <(find work -type f -name gradlew)
+          unzip -q "${zips[0]}" -d project
+          mapfile -t wrappers < <(find project -type f -name gradlew)
           if (( ${#wrappers[@]} != 1 )); then
-            echo 'ERROR: No se encontro un unico gradlew'
+            echo 'No se encontro exactamente un Gradle Wrapper'
             exit 1
           fi
-          PROJECT_DIR="$(cd "$(dirname "${wrappers[0]}")" && pwd)"
-          test -f "$PROJECT_DIR/build.gradle" || { echo 'ERROR: Falta build.gradle'; exit 1; }
-          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
-          echo "Proyecto: $PROJECT_DIR"
+          P="$(cd "$(dirname "${wrappers[0]}")" && pwd)"
+          test -f "$P/build.gradle"
+          echo "PROJECT_DIR=$P" >> "$GITHUB_ENV"
+          mkdir -p logs
 
-      - name: Compilar y llenar caches de Minecraft y NeoForge
+      - name: GameTests maldiciones originales (Etapa 3)
         shell: bash
         run: |
-          set -euo pipefail
+          set +e
           cd "$PROJECT_DIR"
-          chmod +x gradlew
-          ./gradlew assemble --no-daemon --stacktrace 2>&1 | tee "$GITHUB_WORKSPACE/compilacion.log"
+          chmod +x ./gradlew
+          ./gradlew runGameTestServer -PjjkOriginalCurseChecks=true --no-daemon --stacktrace > "$GITHUB_WORKSPACE/logs/gametest-originales.log" 2>&1
+          echo "$?" > "$GITHUB_WORKSPACE/logs/estado-originales.txt"
+          tail -n 90 "$GITHUB_WORKSPACE/logs/gametest-originales.log"
+          exit 0
 
-      - name: Preparar copia COMPLETA para compilar futuras versiones offline
-        if: success()
+      - name: GameTests de regresion de formas vanilla (Etapa 2)
+        shell: bash
+        run: |
+          set +e
+          cd "$PROJECT_DIR"
+          ./gradlew runGameTestServer -PjjkCurseFormChecks=true --no-daemon --stacktrace > "$GITHUB_WORKSPACE/logs/gametest-formas.log" 2>&1
+          echo "$?" > "$GITHUB_WORKSPACE/logs/estado-formas.txt"
+          tail -n 90 "$GITHUB_WORKSPACE/logs/gametest-formas.log"
+          exit 0
+
+      - name: Reunir logs de servidor
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p logs/server
+          if [ -n "${PROJECT_DIR:-}" ]; then
+            find "$PROJECT_DIR" -type f \( -name latest.log -o -name crash-report\*.txt \) -print | while read -r f; do
+              cp "$f" "logs/server/$(basename "$(dirname "$f")")-$(basename "$f")" || true
+            done
+          fi
+
+      - name: Exportar recursos de ejecucion para usar offline en ChatGPT
+        if: always()
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p offline-completo
-          # Incluye modules-2, cache de NeoFormRuntime, metadatos, transformaciones y otros caches Gradle.
-          tar -C "$HOME/.gradle" --exclude='*.lock' -czf offline-completo/gradle-caches-completas.tar.gz caches
-          # Incluye los artefactos de desarrollo de Minecraft creados por ModDevGradle.
-          # Son auxiliares: en versiones nuevas nunca sustituyen el codigo fuente nuevo.
-          tar -C "$PROJECT_DIR" --exclude='*.lock' -czf offline-completo/estado-minecraft-build.tar.gz build .gradle
-          cat > offline-completo/LEEME.txt <<'EOF'
-          ENTORNO OFFLINE DE JJK CONVERGENCE
+          mkdir -p offline-runtime
+          if [ -d "$HOME/.gradle/caches" ]; then
+            # Comprimimos y dividimos para evitar archivos gigantes; cada parte es <= 75 MiB.
+            tar -C "$HOME/.gradle" --exclude='*.lock' -czf - caches | split -b 75M - offline-runtime/gradle-runtime.tar.gz.parte-
+          fi
+          if [ -n "${PROJECT_DIR:-}" ] && [ -d "$PROJECT_DIR/build" ] && [ -d "$PROJECT_DIR/.gradle" ]; then
+            tar -C "$PROJECT_DIR" --exclude='*.lock' -czf - build .gradle | split -b 75M - offline-runtime/minecraft-build.tar.gz.parte-
+          fi
+          cat > offline-runtime/INSTRUCCIONES.txt <<'TEXT'
+          Reunir partes en orden alfabetico:
+          cat gradle-runtime.tar.gz.parte-* > gradle-runtime.tar.gz
+          cat minecraft-build.tar.gz.parte-* > minecraft-build.tar.gz
+          La cache contiene assets de Minecraft, metadatos y configuraciones NeoForge si la descarga/GameTests los resolvio.
+          El segundo archivo es exclusivamente auxiliar: nunca debe reemplazar codigo reciente del mod.
+          TEXT
 
-          Este archivo NO es el JAR ni el codigo fuente del mod.
-          Contiene las dependencias usadas por una compilacion real con Java 25.
-
-          gradle-caches-completas.tar.gz:
-            Extraer dentro de GRADLE_USER_HOME (crea la carpeta caches/).
-
-          estado-minecraft-build.tar.gz:
-            Contiene build/ y .gradle/ de un proyecto que compilo.
-            Conservar como referencia/copia de seguridad de la generacion de Minecraft.
-            NO reemplazar automaticamente archivos del proyecto mas reciente.
-            La cache de configuracion de Gradle puede contener rutas especificas de GitHub;
-            no restaurarla en un proyecto diferente sin comprobar compatibilidad.
-
-          Para compilar localmente, usar Java 25, Gradle Wrapper y el codigo fuente NUEVO.
-          Intentar: ./gradlew assemble --offline --no-daemon --stacktrace
-          Si una version futura cambia NeoForge/Minecraft/Gradle u otras dependencias,
-          puede necesitar cache adicional. La compilacion y GameTests son pruebas distintas.
-          EOF
-          du -h offline-completo/*
-
-      - name: Exportar entorno offline completo
-        if: success()
-        uses: actions/upload-artifact@v4
-        with:
-          name: JJK-ENTORNO-OFFLINE-COMPLETO
-          path: offline-completo/*
-          compression-level: 0
-          retention-days: 30
-          if-no-files-found: error
-
-      - name: Exportar registro de compilacion
+      - name: Descargar resultados de GameTests
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: JJK-LOG-ENTORNO
-          path: compilacion.log
+          name: JJK-GAMETEST-LOGS
+          path: logs/
           if-no-files-found: warn
+          retention-days: 30
+
+      - name: Descargar recursos offline divididos
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: JJK-GAMETEST-RECURSOS-OFFLINE
+          path: offline-runtime/
+          compression-level: 0
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Resultado final verificado
+        shell: bash
+        run: |
+          set -e
+          for f in logs/estado-originales.txt logs/estado-formas.txt; do
+            test -f "$f"
+            if [ "$(cat "$f")" != 0 ]; then
+              echo "GameTest fallo. Revisar logs: $f"
+              exit 1
+            fi
+          done
+          echo 'Los dos comandos de GameTest terminaron con codigo 0.'
