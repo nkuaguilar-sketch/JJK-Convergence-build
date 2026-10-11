@@ -127,7 +127,6 @@ jobs:
           name: jjk-linux-gradle-cache
           path: |
             /home/runner/.gradle/caches/modules-2
-            /home/runner/.gradle/caches/neoformruntime
             build/linux-cache-logs
           if-no-files-found: warn
           compression-level: 6
