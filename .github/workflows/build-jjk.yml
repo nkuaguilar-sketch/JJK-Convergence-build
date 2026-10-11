@@ -1,10 +1,10 @@
-name: JJK Convergence - Compilar y descargar cache
+name: JJK - Exportar entorno completo para compilar offline
 
 on:
   workflow_dispatch:
     inputs:
       source_tag:
-        description: 'Tag de la Release que contiene el ZIP fuente mas reciente'
+        description: 'Tag de la Release que contiene el ZIP fuente ya compilado'
         required: true
         type: string
 
@@ -12,101 +12,101 @@ permissions:
   contents: read
 
 jobs:
-  compilar:
+  compilar_y_exportar:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
-      - name: Obtener repositorio
+      - name: Descargar repositorio
         uses: actions/checkout@v4
 
-      - name: Preparar Java 25
+      - name: Configurar Java 25
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '25'
 
-      - name: Descargar ZIP fuente desde Release
+      - name: Recuperar fuente de la Release
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           SOURCE_TAG: ${{ inputs.source_tag }}
         run: |
           set -euo pipefail
-          mkdir -p source-input
+          mkdir -p source-input work
           gh release download "$SOURCE_TAG" --repo "$GITHUB_REPOSITORY" --pattern '*source*.zip' --dir source-input
-
-      - name: Descomprimir fuente y localizar Gradle
-        run: |
-          set -euo pipefail
           shopt -s nullglob
-          zips=(source-input/*source*.zip)
-          if [ "${#zips[@]}" -ne 1 ]; then
-            echo 'ERROR: La Release debe contener exactamente un archivo *source*.zip'
-            ls -la source-input
+          archives=(source-input/*source*.zip)
+          if (( ${#archives[@]} != 1 )); then
+            echo 'ERROR: La release debe contener un unico ZIP *source*.zip'
             exit 1
           fi
-          mkdir -p work
-          unzip -q "${zips[0]}" -d work
+          unzip -q "${archives[0]}" -d work
           mapfile -t wrappers < <(find work -type f -name gradlew)
-          if [ "${#wrappers[@]}" -ne 1 ]; then
-            echo 'ERROR: Se esperaba encontrar exactamente un gradlew en el ZIP'
+          if (( ${#wrappers[@]} != 1 )); then
+            echo 'ERROR: No se encontro un unico gradlew'
             exit 1
           fi
-          project_dir=$(dirname "${wrappers[0]}")
-          test -f "$project_dir/build.gradle" || { echo 'ERROR: Falta build.gradle'; exit 1; }
-          echo "PROJECT_DIR=$project_dir" >> "$GITHUB_ENV"
-          echo "Proyecto: $project_dir"
-          grep '^mod_version=' "$project_dir/gradle.properties" || true
+          PROJECT_DIR="$(cd "$(dirname "${wrappers[0]}")" && pwd)"
+          test -f "$PROJECT_DIR/build.gradle" || { echo 'ERROR: Falta build.gradle'; exit 1; }
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "Proyecto: $PROJECT_DIR"
 
-      - name: Descargar dependencias y compilar JAR
+      - name: Compilar y llenar caches de Minecraft y NeoForge
         shell: bash
         run: |
           set -euo pipefail
           cd "$PROJECT_DIR"
-          chmod +x ./gradlew
+          chmod +x gradlew
           ./gradlew assemble --no-daemon --stacktrace 2>&1 | tee "$GITHUB_WORKSPACE/compilacion.log"
 
-      - name: Recopilar JAR generado
-        if: always()
+      - name: Preparar copia COMPLETA para compilar futuras versiones offline
+        if: success()
         shell: bash
         run: |
-          mkdir -p jar-compilado
-          if [ -n "${PROJECT_DIR:-}" ] && [ -d "$PROJECT_DIR/build/libs" ]; then
-            find "$PROJECT_DIR/build/libs" -maxdepth 1 -type f -name '*.jar' ! -name '*-sources.jar' ! -name '*-javadoc.jar' -exec cp {} jar-compilado/ \;
-          fi
-          ls -lah jar-compilado
+          set -euo pipefail
+          mkdir -p offline-completo
+          # Incluye modules-2, cache de NeoFormRuntime, metadatos, transformaciones y otros caches Gradle.
+          tar -C "$HOME/.gradle" --exclude='*.lock' -czf offline-completo/gradle-caches-completas.tar.gz caches
+          # Incluye los artefactos de desarrollo de Minecraft creados por ModDevGradle.
+          # Son auxiliares: en versiones nuevas nunca sustituyen el codigo fuente nuevo.
+          tar -C "$PROJECT_DIR" --exclude='*.lock' -czf offline-completo/estado-minecraft-build.tar.gz build .gradle
+          cat > offline-completo/LEEME.txt <<'EOF'
+          ENTORNO OFFLINE DE JJK CONVERGENCE
 
-      - name: Crear paquete de cache para compilar offline
-        if: always()
-        shell: bash
-        run: |
-          if [ -d "$HOME/.gradle/caches/modules-2" ]; then
-            tar -C "$HOME/.gradle/caches" -czf gradle-modules-2-actualizada.tar.gz modules-2
-            ls -lh gradle-modules-2-actualizada.tar.gz
-          else
-            echo 'No se genero cache modules-2'
-          fi
+          Este archivo NO es el JAR ni el codigo fuente del mod.
+          Contiene las dependencias usadas por una compilacion real con Java 25.
 
-      - name: Entregar JAR
+          gradle-caches-completas.tar.gz:
+            Extraer dentro de GRADLE_USER_HOME (crea la carpeta caches/).
+
+          estado-minecraft-build.tar.gz:
+            Contiene build/ y .gradle/ de un proyecto que compilo.
+            Conservar como referencia/copia de seguridad de la generacion de Minecraft.
+            NO reemplazar automaticamente archivos del proyecto mas reciente.
+            La cache de configuracion de Gradle puede contener rutas especificas de GitHub;
+            no restaurarla en un proyecto diferente sin comprobar compatibilidad.
+
+          Para compilar localmente, usar Java 25, Gradle Wrapper y el codigo fuente NUEVO.
+          Intentar: ./gradlew assemble --offline --no-daemon --stacktrace
+          Si una version futura cambia NeoForge/Minecraft/Gradle u otras dependencias,
+          puede necesitar cache adicional. La compilacion y GameTests son pruebas distintas.
+          EOF
+          du -h offline-completo/*
+
+      - name: Exportar entorno offline completo
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: JJK-ENTORNO-OFFLINE-COMPLETO
+          path: offline-completo/*
+          compression-level: 0
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Exportar registro de compilacion
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: JJK-JAR-compilado
-          path: jar-compilado/*.jar
-          if-no-files-found: warn
-
-      - name: Entregar cache actualizada
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: Gradle-cache-actualizada
-          path: gradle-modules-2-actualizada.tar.gz
-          if-no-files-found: warn
-          retention-days: 7
-
-      - name: Entregar registro de compilacion
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: JJK-errores-y-compilacion
+          name: JJK-LOG-ENTORNO
           path: compilacion.log
           if-no-files-found: warn
